@@ -145,7 +145,7 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error>{
                     // filesystem operations are blocking, we have to use threadpool
                     f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
                 };
-                return Ok(HttpResponse::Ok().body("好了"))
+                return Ok(HttpResponse::Ok().json(ResultJson::ok("成功！")))
             },
             None => {
                 let chunk = get_field_chunk(field).await;// field.next().await.unwrap();
