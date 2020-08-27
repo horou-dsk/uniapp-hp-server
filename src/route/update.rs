@@ -25,7 +25,7 @@ struct UpdateInfo {
 #[derive(Serialize, Deserialize)]
 struct ResultOk<T> {
     code: u16,
-    data: T
+    data: T,
 }
 
 impl<T> ResultOk<T> {
@@ -37,7 +37,7 @@ impl<T> ResultOk<T> {
 #[derive(Serialize, Deserialize)]
 struct ResultErr {
     code: u16,
-    err_msg: String
+    err_msg: String,
 }
 
 impl ResultErr {
@@ -48,6 +48,7 @@ impl ResultErr {
 
 
 struct ResultJson;
+
 impl ResultJson {
     fn ok<T>(data: T) -> ResultOk<T> {
         ResultOk::new(data)
@@ -97,66 +98,90 @@ async fn get_field_chunk(mut field: Field) -> BytesMut {
     b
 }
 
-async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error>{
+async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error> {
     // iterate over multipart stream
     let mut token = None;
     let mut project_name = None;
     let mut version: Option<String> = None;
-    let mut pkg_url = "".to_string();
-    while let Ok(Some(mut field)) = payload.try_next().await {
+    let mut pkg_url: Option<String> = None;
+    let save_update = |token: Option<String>, project_name: Option<String>,
+                       version: Option<String>, pkg_url: Option<String>, field: Option<Field>|
+        async move {
+
+            let err = ResultJson::err(500, "参数异常！");
+            let http_err = HttpResponse::Ok().json(serde_json::to_string(&err).unwrap());
+            for has in vec![token, project_name.clone(), version.clone()] {
+                match has {
+                    None => {
+                        return Ok(http_err);
+                    }
+                    _ => {}
+                }
+            }
+
+            let project_name = project_name.unwrap();
+            let dir_path = format!("./tmp/{}", project_name);
+            fs::create_dir_all(dir_path.clone()).unwrap();
+
+            let wgt_url = match pkg_url {
+                Some(_) => "".to_string(),
+                None => {
+                    match field {
+                        Some(mut field) => {
+                            let filename = format!("{}.wgt", project_name);
+                            let filepath = format!("{}/{}", dir_path, sanitize_filename::sanitize(&filename));
+                            info!("{}", filepath);
+                            // File::create is blocking operation, use threadpool
+                            let mut f = web::block(|| std::fs::File::create(filepath))
+                                .await
+                                .unwrap();
+                            // Field in turn is stream of *Bytes* object
+
+                            while let Some(chunk) = field.next().await {
+                                let data = chunk.unwrap();
+                                // filesystem operations are blocking, we have to use threadpool
+                                f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
+                            };
+
+                            format!("{}{}/{}", HOST, project_name, filename)
+                        },
+                        None => {
+                            return Ok(http_err);
+                        }
+                    }
+                }
+            };
+
+            let filepath = format!("{}/{}", dir_path.clone(), "version.json");
+            let mut file = web::block(|| File::create(filepath))
+                .await
+                .unwrap();
+            let version = version.unwrap();
+            let version = UpdateInfo {
+                version,
+                wgt_url,
+                pkg_url: pkg_url.unwrap_or("".to_string()),
+            };
+            let version = serde_json::to_string(&version).unwrap();
+            web::block(move || file.write_all(version.as_bytes())).await.unwrap();
+
+            return Ok(HttpResponse::Ok().json(ResultJson::ok("成功！")));
+        };
+    while let Ok(Some(field)) = payload.try_next().await {
         let content_type = field.content_disposition().unwrap();
         match content_type.get_filename() {
             Some(_) => {
-                for has in vec![token.clone(), project_name.clone(), version.clone()] {
-                    match has {
-                        None => {
-                            let err = ResultJson::err(500, "参数异常！");
-                            return Ok(HttpResponse::Ok().json(serde_json::to_string(&err).unwrap()))
-                        }
-                        _ => {}
-                    }
-                }
-                let project_name = project_name.unwrap();
-                let filename = format!("{}.wgt", project_name);
-                let dir_path = format!("./tmp/{}", project_name);
-                fs::create_dir_all(dir_path.clone()).unwrap();
-                let filepath = format!("{}/{}", dir_path.clone(), "version.json");
-                let mut file = web::block(|| File::create(filepath))
-                    .await
-                    .unwrap();
-                let version = version.unwrap();
-                let version = UpdateInfo {
-                    version,
-                    wgt_url: format!("{}{}/{}", HOST, project_name, filename),
-                    pkg_url,
-                };
-                let version = serde_json::to_string(&version).unwrap();
-                web::block(move || file.write_all(version.as_bytes())).await.unwrap();
-                let filepath = format!("{}/{}", dir_path, sanitize_filename::sanitize(&filename));
-                println!("{}", filepath);
-                // File::create is blocking operation, use threadpool
-                let mut f = web::block(|| std::fs::File::create(filepath))
-                    .await
-                    .unwrap();
-                // Field in turn is stream of *Bytes* object
-
-                while let Some(chunk) = field.next().await {
-                    let data = chunk.unwrap();
-                    // filesystem operations are blocking, we have to use threadpool
-                    f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
-                };
-                return Ok(HttpResponse::Ok().json(ResultJson::ok("成功！")))
-            },
+                return save_update(token.clone(), project_name.clone(), version.clone(), pkg_url.clone(), Some(field)).await;
+            }
             None => {
                 let chunk = get_field_chunk(field).await;// field.next().await.unwrap();
                 let name = content_type.get_name().unwrap();
                 let vec = chunk.to_vec();
-                println!("{}", name);
                 let value = String::from_utf8_lossy(&vec).to_string();
                 match name {
                     "token" => {
                         if value.as_str() != TOKEN {
-                            break
+                            break;
                         }
                         token = Some(value);
                     }
@@ -167,7 +192,7 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error>{
                         version = Some(value);
                     }
                     "pkg_url" => {
-                        pkg_url = value;
+                        pkg_url = Some(value);
                     }
                     _ => {}
                 }
@@ -175,8 +200,9 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error>{
             }
         };
     }
-    let err = ResultJson::err(500, "参数异常！");
-    return Ok(HttpResponse::Ok().json(serde_json::to_string(&err).unwrap()))
+    return save_update(token, project_name, version, pkg_url, None).await;
+    // let err = ResultJson::err(500, "参数异常！");
+    // return Ok(HttpResponse::Ok().json(serde_json::to_string(&err).unwrap()));
 }
 
 pub fn update_config(cfg: &mut web::ServiceConfig) {
