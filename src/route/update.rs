@@ -7,6 +7,7 @@ use futures::{StreamExt, TryStreamExt};
 use std::fs::{self, File};
 use bytes::{BytesMut, BufMut};
 use qstring::QString;
+use regex::Regex;
 
 const TOKEN: &str = "iQGhBUxcLRxE2xmwRJQ05a5YI8w1woWu";
 const HOST: &str = "http://47.108.64.61:9699/update/projects/";
@@ -231,6 +232,10 @@ fn delete_wgt(req: HttpRequest) -> HttpResponse {
             return HttpResponse::Ok().json(ResultJson::err(500, "请输入项目名"))
         }
     };
+    let re = Regex::new(r"^[a-zA-Z-_]+$").unwrap();
+    if !re.is_match(project_name) {
+        return HttpResponse::Ok().json(ResultJson::err(500, "参数异常"))
+    }
     let platform = qs.get("platform").unwrap_or("");
     let project_filename = match platform {
         "ios" => format!("{}-ios", project_name),

@@ -810,6 +810,7 @@ dependencies = [
  "futures",
  "log",
  "qstring",
+ "regex",
  "sanitize-filename",
  "serde",
  "serde_json",
