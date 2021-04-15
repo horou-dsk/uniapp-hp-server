@@ -133,7 +133,7 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error> {
                 _ => project_name.clone()
             };
             let dir_path = format!("./tmp/{}", project_filename);
-            fs::create_dir_all(dir_path.clone()).unwrap();
+            fs::create_dir_all(&dir_path).unwrap();
 
             let wgt_url = match pkg_url {
                 Some(_) => "".to_string(),
@@ -164,7 +164,7 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error> {
                 }
             };
 
-            let filepath = format!("{}/{}", dir_path.clone(), "version.json");
+            let filepath = format!("{}/{}", dir_path, "version.json");
             let mut file = web::block(|| File::create(filepath))
                 .await
                 .unwrap();
