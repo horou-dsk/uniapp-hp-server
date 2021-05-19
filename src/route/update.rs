@@ -1,27 +1,41 @@
 use log::{info};
 use actix_web::{web, HttpResponse, Error, HttpRequest};
 use serde::{Serialize, Deserialize};
-use std::io::{Write, Read};
+use std::io::{Read};
 use actix_multipart::{Multipart, Field};
 use futures::{StreamExt, TryStreamExt};
-use std::fs::{self, File};
-use bytes::{BytesMut, BufMut};
+use std::fs::{File};
+use tokio::fs::{self as afs, File as AsyncFile, OpenOptions};
+use bytes::{BytesMut, BufMut, Bytes, Buf};
 use qstring::QString;
 use regex::Regex;
+use std::collections::HashMap;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use std::option::Option::Some;
 
 const TOKEN: &str = "iQGhBUxcLRxE2xmwRJQ05a5YI8w1woWu";
-const HOST: &str = "http://47.108.64.61:9699/update/projects/";
+
+lazy_static! {
+    static ref HOST: String = {
+        let mut host = String::new();
+        let mut file = File::open("./HOST.txt").unwrap();
+        file.read_to_string(&mut host).unwrap();
+        format!("http://{}:22336/update/projects/", host.trim())
+    };
+}
+// const HOST: &str = "http://:9699/";
 
 #[derive(Serialize, Deserialize)]
 struct Info {
     username: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct UpdateInfo {
     version: String,
     wgt_url: String,
     pkg_url: String,
+    update_log: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,11 +75,48 @@ impl ResultJson {
     }
 }
 
+// mod http_result {
+//     use actix_web::HttpResponse;
+//     use crate::route::update::ResultJson;
+//
+//     fn ok<T>(data: T) -> HttpResponse {
+//         HttpResponse::Ok().json(ResultJson::ok(data))
+//     }
+// }
+
+async fn read_versions(path: &str) -> Result<Vec<UpdateInfo>, tokio::io::Error> {
+    let mut version_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .await?;
+    let mut json_str = String::new();
+    version_file.read_to_string(&mut json_str).await?;
+    Ok(match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => Vec::new()
+    })
+}
+
+async fn write_versions<T>(path: &str, v: &T) -> Result<(), tokio::io::Error>
+    where
+        T: ?Sized + Serialize,
+{
+    let mut version_file = OpenOptions::new().write(true).truncate(true).open(path).await?;
+    version_file.write_all(serde_json::to_string(v)?.as_bytes()).await?;
+    Ok(())
+}
+
 fn get_version(req: HttpRequest) -> HttpResponse {
     let qs = QString::from(req.query_string());
     // println!("{}", qs.get("project").unwrap());
     let project_name: String = req.match_info().query("project_name").parse().unwrap();
     let platform = qs.get("platform").unwrap_or("没得");
+    let version = match qs.get("version") {
+        Some(v) => v.to_string(),
+        None => return HttpResponse::Ok().json(ResultJson::err(400, "参数错误！"))
+    };
     let project_filename = match platform {
         "ios" => format!("{}-ios", project_name),
         _ => project_name.clone()
@@ -81,15 +132,36 @@ fn get_version(req: HttpRequest) -> HttpResponse {
 
     let mut version_json = String::new();
     file.read_to_string(&mut version_json).unwrap();
-    let info: UpdateInfo = serde_json::from_str(&*version_json).unwrap();
-    info!("项目 {} 获取版本号 {}", project_filename, info.version);
-    let info = ResultJson::ok(info);
-    HttpResponse::Ok().json(info)
+    let infos: Vec<UpdateInfo> = serde_json::from_str(&*version_json).unwrap();
+    let mut info = None;
+    for ui in &infos {
+        if info.is_some() {
+            info = Some(ui);
+            if !ui.pkg_url.is_empty() {
+                break
+            }
+        } else if ui.version > version {
+            info = Some(ui);
+        }
+    }
+    // let info = infos.iter()
+    //     .find_map(|v| if v.version == version { Some(v) } else { None });
+    match info {
+        Some(info) => {
+            info!("项目 {} 获取版本号 {}", project_filename, info.version);
+            let info = ResultJson::ok(info);
+            HttpResponse::Ok().json(info)
+        }
+        None => {
+            HttpResponse::Ok().json(ResultJson::err(500, "没有更新可用！"))
+        }
+    }
 }
 
 fn check_update() -> HttpResponse {
     // let qs = QString::from(req.query_string());
     let update_info = UpdateInfo {
+        update_log: "".to_string(),
         version: "1.0.0".to_string(),
         wgt_url: "http://www.baidu.com".to_string(),
         pkg_url: "http://www.google.com".to_string(),
@@ -97,134 +169,103 @@ fn check_update() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::to_string(&update_info).unwrap())
 }
 
-async fn get_field_chunk(mut field: Field) -> BytesMut {
+async fn get_field_chunk(mut field: Field) -> Bytes {
     let mut b = BytesMut::new();
     while let Some(chunk) = field.next().await {
         b.put(chunk.unwrap())
     };
-    b
+    b.to_bytes()
+}
+
+async fn save_update(map: HashMap<String, String>, filed: Option<Bytes>) -> Result<(), Box<dyn std::error::Error>> {
+    let project_name = &map["project_name"];
+    let version = &map["version"];
+    let update_log = &map["update_log"];
+    let project_filename = match project_name.as_str() {
+        "ios" => format!("{}-ios", project_name),
+        _ => project_name.to_string()
+    };
+    let pkg_url = map.get("pkg_url");
+    let dir_path = format!("./tmp/{}", project_filename);
+    afs::create_dir_all(&dir_path).await.unwrap();
+
+    let wgt_url = match pkg_url {
+        Some(_) => "".to_string(),
+        None => {
+            if let Some(field) = filed {
+                let filename = format!("{}.wgt", version);
+                let filepath = format!("{}/{}", dir_path, sanitize_filename::sanitize(&filename));
+                info!("热更新wgt保存地址 = {}", filepath);
+                let mut f = AsyncFile::create(filepath).await?;
+                f.write_all(&field).await?;
+                // while let Some(chunk) = field.next().await {
+                //     let data = chunk.unwrap();
+                //     // filesystem operations are blocking, we have to use threadpool
+                //     f.write_all(&data).await?;
+                //     // f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
+                // };
+                format!("{}{}/{}", *HOST, project_filename, filename)
+            } else {
+                panic!("读取更新文件流错误")
+            }
+        }
+    };
+    let filepath = format!("{}/{}", dir_path, "version.json");
+    let mut versions = read_versions(&filepath).await?;
+    let update_info = UpdateInfo {
+        version: version.clone(),
+        wgt_url,
+        pkg_url: pkg_url.unwrap_or(&"".to_string()).to_string(),
+        update_log: update_log.clone(),
+    };
+    let info = versions.iter_mut()
+        .find_map(|v| if v.version == update_info.version { Some(v) } else { None });
+    if let Some(info) = info {
+        *info = update_info;
+    } else {
+        versions.push(update_info);
+    }
+    versions.sort_by(|a, b| a.version.cmp(&b.version));
+    write_versions(&filepath, &versions).await?;
+    Ok(())
 }
 
 async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error> {
-    // iterate over multipart stream
-    // let mut token = None;
-    // let mut project_name = None;
-    // let mut version: Option<String> = None;
-    // let mut pkg_url: Option<String> = None;
-    // token, project_name, platform, version, pkg_url
-    let mut other_param: (_, _, _, Option<String>, Option<String>) = (None, None, None, None, None);
-    let save_update = |other_param: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), field: Option<Field>|
-        async move {
-            let (token, project_name, platform, version, pkg_url) = other_param;
-            let err = ResultJson::err(500, "参数异常！");
-            let http_err = HttpResponse::Ok().json(serde_json::to_string(&err).unwrap());
-            for has in vec![token, platform.clone(), project_name.clone(), version.clone()] {
-                match has {
-                    None => {
-                        return Ok(http_err);
-                    }
-                    _ => {}
-                }
-            }
-
-            let project_name = project_name.unwrap();
-            let project_filename = match platform.unwrap().as_str() {
-                "ios" => format!("{}-ios", project_name),
-                _ => project_name.clone()
-            };
-            let dir_path = format!("./tmp/{}", project_filename);
-            fs::create_dir_all(&dir_path).unwrap();
-
-            let wgt_url = match pkg_url {
-                Some(_) => "".to_string(),
-                None => {
-                    match field {
-                        Some(mut field) => {
-                            let filename = format!("{}.wgt", project_name);
-                            let filepath = format!("{}/{}", dir_path, sanitize_filename::sanitize(&filename));
-                            info!("{}", filepath);
-                            // File::create is blocking operation, use threadpool
-                            let mut f = web::block(|| std::fs::File::create(filepath))
-                                .await
-                                .unwrap();
-                            // Field in turn is stream of *Bytes* object
-
-                            while let Some(chunk) = field.next().await {
-                                let data = chunk.unwrap();
-                                // filesystem operations are blocking, we have to use threadpool
-                                f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
-                            };
-
-                            format!("{}{}/{}", HOST, project_filename, filename)
-                        },
-                        None => {
-                            return Ok(http_err);
-                        }
-                    }
-                }
-            };
-
-            let filepath = format!("{}/{}", dir_path, "version.json");
-            let mut file = web::block(|| File::create(filepath))
-                .await
-                .unwrap();
-            let version = version.unwrap();
-            let version = UpdateInfo {
-                version,
-                wgt_url,
-                pkg_url: pkg_url.unwrap_or("".to_string()),
-            };
-            let version = serde_json::to_string(&version).unwrap();
-            web::block(move || file.write_all(version.as_bytes())).await.unwrap();
-
-            return Ok(HttpResponse::Ok().json(ResultJson::ok("成功！")));
-        };
+    let mut file_field = None;
+    let mut map = HashMap::new();
     while let Ok(Some(field)) = payload.try_next().await {
         let content_type = field.content_disposition().unwrap();
         match content_type.get_filename() {
             Some(_) => {
-                return save_update(other_param, Some(field)).await;
+                file_field = Some(get_field_chunk(field).await);
             }
             None => {
                 let chunk = get_field_chunk(field).await;// field.next().await.unwrap();
                 let name = content_type.get_name().unwrap();
                 let vec = chunk.to_vec();
                 let value = String::from_utf8_lossy(&vec).to_string();
-                match name {
-                    "token" => {
-                        if value.as_str() != TOKEN {
-                            break;
-                        }
-                        other_param.0 = Some(value);
-                    }
-                    "project_name" => {
-                        other_param.1 = Some(value);
-                    }
-                    "platform" => {
-                        other_param.2 = Some(value);
-                    }
-                    "version" => {
-                        other_param.3 = Some(value);
-                    }
-                    "pkg_url" => {
-                        other_param.4 = Some(value);
-                    }
-                    _ => {}
+                if name == "token" && value.as_str() != TOKEN {
+                    return Ok(HttpResponse::Ok().json(ResultJson::err(500, "参数错误")));
                 }
-                // println!("{} = {}", name, );
+                map.insert(name.to_string(), value);
             }
         };
     }
-    return save_update(other_param, None).await;
-    // let err = ResultJson::err(500, "参数异常！");
-    // return Ok(HttpResponse::Ok().json(serde_json::to_string(&err).unwrap()));
+    if map.get("token").is_none() || map.get("token").unwrap() != TOKEN {
+        return Ok(HttpResponse::Ok().json(ResultJson::err(400, "参数错误！")))
+    }
+    Ok(match save_update(map, file_field).await {
+        Ok(_) => HttpResponse::Ok().json(ResultJson::ok("上传更新成功！")),
+        Err(_) => HttpResponse::Ok().json(ResultJson::err(500, "上传更新失败！"))
+    })
 }
 
-fn delete_wgt(req: HttpRequest) -> HttpResponse {
+async fn delete_wgt(req: HttpRequest) -> HttpResponse {
     let qs = QString::from(req.query_string());
     let token = qs.get("token").unwrap_or("");
-    if token != TOKEN {
-        return HttpResponse::Ok().json(ResultJson::err(500, "参数异常"));
+    let version = qs.get("version").unwrap_or("");
+    if token != TOKEN || version == "" {
+        return HttpResponse::Ok().json(ResultJson::err(400, "参数异常"));
     }
     let project_name = match qs.get("project_name") {
         Some(name) => name,
@@ -234,18 +275,36 @@ fn delete_wgt(req: HttpRequest) -> HttpResponse {
     };
     let re = Regex::new(r"^[a-zA-Z-_]+$").unwrap();
     if !re.is_match(project_name) {
-        return HttpResponse::Ok().json(ResultJson::err(500, "参数异常"))
+        return HttpResponse::Ok().json(ResultJson::err(400, "参数异常"))
     }
     let platform = qs.get("platform").unwrap_or("");
     let project_filename = match platform {
         "ios" => format!("{}-ios", project_name),
         _ => project_name.to_string()
     };
+    let filename = format!("{}.wgt", version);
     let dir_path = format!("./tmp/{}", project_filename);
-    match fs::remove_dir_all(dir_path) {
-        Ok(_) => HttpResponse::Ok().json(ResultJson::ok("删除成功")),
-        Err(_) => HttpResponse::Ok().json(ResultJson::err(500, "删除失败"))
+    let version_path = format!("{}/{}", dir_path, "version.json");
+    let wgt_path = format!("{}/{}", dir_path, sanitize_filename::sanitize(&filename));
+    let mut versions = read_versions(&version_path).await.unwrap();
+    let (mut delete, mut pkg) = (false, false);
+    for index in 0..versions.len() {
+        if versions[index].version == version {
+            if !versions[index].pkg_url.is_empty() {
+                pkg = true;
+            }
+            versions.remove(index);
+            delete = true;
+            break;
+        }
     }
+    if delete {
+        write_versions(&version_path, &versions).await.unwrap();
+        if pkg || afs::remove_file(wgt_path).await.is_ok() {
+            return HttpResponse::Ok().json(ResultJson::ok("删除成功"));
+        }
+    }
+    HttpResponse::Ok().json(ResultJson::err(500, "删除失败"))
 }
 
 pub fn update_config(cfg: &mut web::ServiceConfig) {

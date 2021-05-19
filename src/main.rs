@@ -19,7 +19,7 @@ fn setup_logger() -> Result<(), fern::InitError> {
         })
         .level(log::LevelFilter::Debug)
         .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
+        // .chain(fern::log_file("output.log")?)
         .apply()?;
     Ok(())
 }
@@ -46,7 +46,7 @@ async fn main() -> std::io::Result<()> {
             // .wrap(Logger::new("%a %{User-Agent}i"))
             .service(web::scope("/update").configure(update_config))
     })
-        .bind("0.0.0.0:9699")?
+        .bind("0.0.0.0:22336")?
         .run()
         .await
 }

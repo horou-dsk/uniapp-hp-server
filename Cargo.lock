@@ -808,12 +808,14 @@ dependencies = [
  "env_logger",
  "fern",
  "futures",
+ "lazy_static",
  "log",
  "qstring",
  "regex",
  "sanitize-filename",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
