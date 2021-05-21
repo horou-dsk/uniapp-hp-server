@@ -84,12 +84,12 @@ impl ResultJson {
 //     }
 // }
 
-async fn read_versions(path: &str) -> Result<Vec<UpdateInfo>, tokio::io::Error> {
+async fn read_versions(version_path: &str) -> Result<Vec<UpdateInfo>, tokio::io::Error> {
     let mut version_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(path)
+        .open(version_path)
         .await?;
     let mut json_str = String::new();
     version_file.read_to_string(&mut json_str).await?;
@@ -108,7 +108,7 @@ async fn write_versions<T>(path: &str, v: &T) -> Result<(), tokio::io::Error>
     Ok(())
 }
 
-fn get_version(req: HttpRequest) -> HttpResponse {
+async fn get_version(req: HttpRequest) -> HttpResponse {
     let qs = QString::from(req.query_string());
     // println!("{}", qs.get("project").unwrap());
     let project_name: String = req.match_info().query("project_name").parse().unwrap();
@@ -121,8 +121,9 @@ fn get_version(req: HttpRequest) -> HttpResponse {
         "ios" => format!("{}-ios", project_name),
         _ => project_name.clone()
     };
-    let mut file = match File::open("./tmp/".to_string() + &*project_filename + "/version.json") {
-        Ok(file) => file,
+
+    let infos = match read_versions(&format!("./tmp/{}/version.json", project_filename)).await {
+        Ok(v) => v,
         Err(_) => {
             let err = ResultJson::err(500, "没有找到项目");
             return HttpResponse::Ok().content_type("application/json;charset=utf-8")
@@ -130,9 +131,6 @@ fn get_version(req: HttpRequest) -> HttpResponse {
         }
     };
 
-    let mut version_json = String::new();
-    file.read_to_string(&mut version_json).unwrap();
-    let infos: Vec<UpdateInfo> = serde_json::from_str(&*version_json).unwrap();
     let mut info = None;
     for ui in &infos {
         if info.is_some() {
@@ -181,7 +179,9 @@ async fn save_update(map: HashMap<String, String>, filed: Option<Bytes>) -> Resu
     let project_name = &map["project_name"];
     let version = &map["version"];
     let update_log = &map["update_log"];
-    let project_filename = match project_name.as_str() {
+    let nil = "".to_string();
+    let platform = map.get("platform").unwrap_or(&nil);
+    let project_filename = match &platform[..] {
         "ios" => format!("{}-ios", project_name),
         _ => project_name.to_string()
     };
@@ -242,11 +242,7 @@ async fn save_wgt(mut payload: Multipart) -> Result<HttpResponse, Error> {
             None => {
                 let chunk = get_field_chunk(field).await;// field.next().await.unwrap();
                 let name = content_type.get_name().unwrap();
-                let vec = chunk.to_vec();
-                let value = String::from_utf8_lossy(&vec).to_string();
-                if name == "token" && value.as_str() != TOKEN {
-                    return Ok(HttpResponse::Ok().json(ResultJson::err(500, "参数错误")));
-                }
+                let value = String::from_utf8_lossy(&chunk.to_vec()).to_string();
                 map.insert(name.to_string(), value);
             }
         };
